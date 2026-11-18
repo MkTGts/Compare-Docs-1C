@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import re
 import os
 from pathlib import Path
@@ -14,20 +14,25 @@ def extract_id_real(text):
         return match.group(2).lstrip('0')
     return None
 
-def read_first_sheet(path, description):
-    """Читает первый лист .xlsx или .xls и возвращает строки как списки значений."""
+def read_workbook_sheets(path, description):
+    """Читает все листы книги .xlsx или .xls."""
     extension = Path(path).suffix.lower()
     try:
         if extension == ".xlsx":
             workbook = load_workbook(path, data_only=True, read_only=True)
             try:
-                return [list(row) for row in workbook.active.iter_rows(values_only=True)]
+                return [
+                    (sheet.title, [list(row) for row in sheet.iter_rows(values_only=True)])
+                    for sheet in workbook.worksheets
+                ]
             finally:
                 workbook.close()
         if extension == ".xls":
             workbook = xlrd.open_workbook(path)
-            sheet = workbook.sheet_by_index(0)
-            return [sheet.row_values(row_idx) for row_idx in range(sheet.nrows)]
+            return [
+                (sheet.name, [sheet.row_values(row_idx) for row_idx in range(sheet.nrows)])
+                for sheet in workbook.sheets()
+            ]
     except Exception as error:
         raise ValueError(
             f"Не удалось прочитать {description} «{path}» как файл {extension}. "
@@ -35,6 +40,238 @@ def read_first_sheet(path, description):
             f"Подробности: {error}"
         ) from error
     raise ValueError(f"Формат {description} не поддерживается. Используйте .xls или .xlsx.")
+
+def normalized_header(value):
+    return re.sub(r"[^a-zа-яё0-9]", "", str(value or "").lower())
+
+def column_letter(index):
+    result = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+def guess_columns(kind, rows):
+    """Предлагает столбцы по заголовкам, затем по содержимому первых строк."""
+    count = max((len(row) for row in rows), default=0)
+    if count == 0:
+        return (0, 1) if kind == "bp" else (1, 2), False
+
+    first_row = rows[0] if rows else []
+    aliases = {
+        "bp": {
+            "number": {"номер", "номдокумента", "номердокумента", "документ", "№", "docnumber"},
+            "amount": {"сумма", "суммадокумента", "итого", "суммабп", "amount", "total"},
+        },
+        "real": {
+            "text": {"продажи", "документ", "наименование", "содержание", "основание", "операция", "text"},
+            "amount": {"сумма", "суммадокумента", "итого", "суммареал", "amount", "total"},
+        },
+    }[kind]
+    header_matches = {}
+    for field, names in aliases.items():
+        header_matches[field] = next(
+            (i for i, value in enumerate(first_row) if normalized_header(value) in names), None
+        )
+
+    has_header = any(index is not None for index in header_matches.values())
+    data_rows = rows[1:] if has_header else rows
+    if kind == "bp":
+        number_col = header_matches["number"]
+        amount_col = header_matches["amount"]
+        if number_col is None:
+            number_col = max(range(count), key=lambda col: sum(
+                1 for row in data_rows[:100] if col < len(row) and re.search(r"\d+", str(row[col] or ""))
+            ))
+        if amount_col is None:
+            amount_col = max(range(count), key=lambda col: sum(
+                1 for row in data_rows[:100] if col < len(row) and is_number(row[col])
+            ))
+        if amount_col == number_col and count > 1:
+            amount_col = 1 if number_col != 1 else 0
+        return (number_col, amount_col), has_header
+
+    text_col = header_matches["text"]
+    if text_col is None:
+        text_col = max(range(count), key=lambda col: sum(
+            1 for row in data_rows[:100]
+            if col < len(row) and "реализац" in str(row[col] or "").lower()
+        ))
+    amount_col = header_matches["amount"]
+    if amount_col is None:
+        amount_col = max(range(count), key=lambda col: sum(
+            1 for row in data_rows[:100] if col != text_col and col < len(row) and is_number(row[col])
+        ))
+    if amount_col == text_col and count > 1:
+        amount_col = 2 if text_col != 2 and count > 2 else (1 if text_col != 1 else 0)
+    return (text_col, amount_col), has_header
+
+def is_number(value):
+    if value is None or value == "":
+        return False
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+def choose_columns(bp_sheets, real_sheets):
+    """Показывает автоопределение, выбор листов/столбцов и предпросмотр."""
+    dialog = tk.Toplevel(root)
+    dialog.title("Проверьте распознанные столбцы")
+    screen_width = dialog.winfo_screenwidth()
+    screen_height = dialog.winfo_screenheight()
+    width = max(520, min(820, screen_width - 40))
+    height = max(480, min(650, screen_height - 80))
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    dialog.geometry(f"{width}x{height}+{x}+{y}")
+    dialog.minsize(min(width, 620), min(height, 520))
+    dialog.transient(root)
+
+    result = {"value": None}
+    panels = {}
+
+    def make_panel(parent, key, title, sheets, kind, fields):
+        box = ttk.LabelFrame(parent, text=title, padding=10)
+        box.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        sheet_var = tk.StringVar(value=sheets[0][0] if sheets else "")
+        ttk.Label(box, text="Лист:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        sheet_combo = ttk.Combobox(box, textvariable=sheet_var, state="readonly",
+                                   values=[name for name, _ in sheets], width=36)
+        sheet_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+
+        skip_var = tk.BooleanVar(value=False)
+        field_vars = {field: tk.StringVar() for field, _ in fields}
+        field_combos = {}
+        for row_index, (field, label) in enumerate(fields, start=1):
+            ttk.Label(box, text=label + ":").grid(row=row_index, column=0, sticky="w", padx=4, pady=4)
+            combo = ttk.Combobox(box, textvariable=field_vars[field], state="readonly", width=48)
+            combo.grid(row=row_index, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+            field_combos[field] = combo
+
+        checkbox_row = len(fields) + 1
+        ttk.Checkbutton(box, text="Пропустить первую строку (это заголовки)", variable=skip_var,
+                        command=lambda: update_preview(key)).grid(
+                            row=checkbox_row, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+        reset_row = checkbox_row + 1
+        reset_label = "Автоподбор столбцов БП" if kind == "bp" else "Автоподбор столбцов УТ"
+        ttk.Button(box, text=reset_label, command=lambda panel_key=key: refresh_panel(panel_key)).grid(
+            row=reset_row, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+        preview_row = reset_row + 1
+        ttk.Label(box, text="Предпросмотр первых строк:").grid(
+            row=preview_row, column=0, columnspan=4, sticky="w", padx=4, pady=(6, 2))
+        preview = tk.Text(box, height=4, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED)
+        preview.grid(row=preview_row + 1, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+        box.columnconfigure(1, weight=1)
+        panels[key] = {
+            "sheets": sheets, "kind": kind, "sheet_var": sheet_var,
+            "sheet_combo": sheet_combo, "skip_var": skip_var,
+            "field_vars": field_vars, "field_combos": field_combos, "preview": preview,
+        }
+        sheet_combo.bind("<<ComboboxSelected>>", lambda _event, panel_key=key: refresh_panel(panel_key))
+        refresh_panel(key)
+
+    def selected_sheet(panel):
+        selected_name = panel["sheet_var"].get()
+        return next(((i, rows) for i, (name, rows) in enumerate(panel["sheets"]) if name == selected_name), (0, []))
+
+    def update_preview(key):
+        panel = panels[key]
+        _, rows = selected_sheet(panel)
+        start = 1 if panel["skip_var"].get() else 0
+        shown = rows[start:start + 5]
+        lines = []
+        for row_num, values in enumerate(shown, start=start + 1):
+            cells = [str(value).replace("\n", " ")[:36] if value not in (None, "") else "" for value in values[:8]]
+            lines.append(f"{row_num}: " + " | ".join(cells))
+        if not lines:
+            lines = ["На выбранном листе нет строк для предпросмотра."]
+        preview = panel["preview"]
+        preview.config(state=tk.NORMAL)
+        preview.delete("1.0", tk.END)
+        preview.insert("1.0", "\n".join(lines))
+        preview.config(state=tk.DISABLED)
+
+    def refresh_panel(key):
+        panel = panels[key]
+        _, rows = selected_sheet(panel)
+        guesses, has_header = guess_columns(panel["kind"], rows)
+        panel["skip_var"].set(has_header)
+        count = max((len(row) for row in rows), default=0)
+        first_row = rows[0] if rows else []
+        choices = [
+            f"{column_letter(i)} — {str(first_row[i]).strip()[:36] if i < len(first_row) and first_row[i] not in (None, '') else 'столбец ' + column_letter(i)}"
+            for i in range(count)
+        ]
+        for position, (field, _label) in enumerate(panel["field_combos"].items()):
+            combo = panel["field_combos"][field]
+            combo["values"] = choices
+            if choices:
+                combo.current(min(guesses[position], len(choices) - 1))
+            else:
+                panel["field_vars"][field].set("")
+        update_preview(key)
+
+    def save_selection():
+        selections = {}
+        for key, panel in panels.items():
+            sheet_index, rows = selected_sheet(panel)
+            chosen = []
+            for field, _label in panel["field_combos"].items():
+                index = panel["field_combos"][field].current()
+                if index < 0:
+                    messagebox.showwarning("Не выбран столбец", f"Выберите столбцы для раздела «{key}».", parent=dialog)
+                    return
+                chosen.append(index)
+            if len(set(chosen)) != len(chosen):
+                messagebox.showwarning("Проверьте столбцы", "Для разных данных выбраны одинаковые столбцы.", parent=dialog)
+                return
+            selections[key] = {
+                "sheet_index": sheet_index,
+                "rows": rows,
+                "columns": chosen,
+                "skip_header": panel["skip_var"].get(),
+            }
+        result["value"] = selections
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    ttk.Label(dialog, text="Проверьте автоподбор отдельно для каждой таблицы. Выберите лист и столбцы, затем сверьте выбор с предпросмотром.",
+              wraplength=width - 40).pack(anchor="w", padx=14, pady=(8, 2))
+
+    buttons = ttk.Frame(dialog)
+    buttons.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=8)
+    ttk.Button(buttons, text="Открыть инструкцию", command=lambda: show_instructions(dialog)).pack(side=tk.LEFT, padx=4)
+    ttk.Button(buttons, text="Отмена", command=cancel).pack(side=tk.RIGHT, padx=4)
+    ttk.Button(buttons, text="Продолжить сверку", command=save_selection).pack(side=tk.RIGHT, padx=4)
+
+    content = ttk.Frame(dialog)
+    content.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=2)
+    canvas = tk.Canvas(content, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(content, orient=tk.VERTICAL, command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    panels_frame = ttk.Frame(canvas)
+    canvas_window = canvas.create_window((0, 0), window=panels_frame, anchor="nw")
+
+    def update_scroll_region(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def resize_panels(event):
+        canvas.itemconfigure(canvas_window, width=event.width)
+
+    panels_frame.bind("<Configure>", update_scroll_region)
+    canvas.bind("<Configure>", resize_panels)
+    make_panel(panels_frame, "bp", "Документы БП", bp_sheets, "bp", [("number", "Номер документа"), ("amount", "Сумма")])
+    make_panel(panels_frame, "real", "Документы УТ / реализации", real_sheets, "real", [("text", "Текст документа"), ("amount", "Сумма")])
+    dialog.grab_set()
+    root.wait_window(dialog)
+    return result["value"]
 
 def run_comparison():
     file_bp = entry_bp.get().strip()
@@ -71,78 +308,79 @@ def run_comparison():
         messagebox.showwarning("Проверьте выбранные файлы", "Исправьте следующие пункты:\n\n• " + "\n• ".join(path_errors))
         return
 
+    try:
+        bp_sheets = read_workbook_sheets(file_bp, "файл БП")
+        real_sheets = read_workbook_sheets(file_real, "файл реализаций")
+    except Exception as error:
+        messagebox.showerror("Ошибка чтения", str(error))
+        return
+
+    if not bp_sheets:
+        messagebox.showwarning("Пустая книга", "В файле БП нет листов.")
+        return
+    if not real_sheets:
+        messagebox.showwarning("Пустая книга", "В файле реализаций нет листов.")
+        return
+
+    selected = choose_columns(bp_sheets, real_sheets)
+    if selected is None:
+        return
+
+    bp_selection = selected["bp"]
+    real_selection = selected["real"]
+    bp_rows = bp_selection["rows"]
+    real_rows = real_selection["rows"]
+    col_nomer, col_summa = bp_selection["columns"]
+    col_real_text, col_real_sum = real_selection["columns"]
+    bp_start = 1 if bp_selection["skip_header"] else 0
+    real_start = 1 if real_selection["skip_header"] else 0
+
     btn_run.config(text="Обработка...", state=tk.DISABLED)
     root.update()
 
     try:
-        # 1. Чтение файла БП
-        bp_rows = read_first_sheet(file_bp, "файл БП")
-        if not bp_rows:
-            raise ValueError("Файл БП пуст: на первом листе нет строки заголовков.")
-        headers = bp_rows[0]
-        missing_headers = [name for name in ('Номер', 'Сумма') if name not in headers]
-        if missing_headers:
-            raise ValueError(
-                "В файле БП на первом листе не найдены обязательные заголовки: "
-                + ', '.join(f'«{name}»' for name in missing_headers)
-                + f". Найденные заголовки: {headers}"
-            )
-        col_nomer = headers.index('Номер')
-        col_summa = headers.index('Сумма')
+        # 1. Чтение выбранных столбцов таблицы БП
 
         bp_data = {}
         bp_row_errors = []
-        for excel_row, row in enumerate(bp_rows[1:], start=2):
-            if len(row) > max(col_nomer, col_summa):
-                nomer = row[col_nomer]
-                summa = row[col_summa]
-                if nomer is None and summa is None:
-                    continue
-                match = re.search(r'(\d+)', str(nomer)) if nomer is not None else None
-                if not match:
-                    bp_row_errors.append(f"БП, строка {excel_row}: в столбце «Номер» нет номера с цифрами.")
-                    continue
-                id_clean = match.group(1).lstrip('0')
-                try:
-                    s = float(summa) if summa is not None else 0.0
-                except (TypeError, ValueError):
-                    bp_row_errors.append(f"БП, строка {excel_row}: сумма «{summa}» не является числом.")
-                    continue
-                bp_data[id_clean] = {'Номер': str(nomer), 'Сумма_БП': s}
+        for excel_row, row in enumerate(bp_rows[bp_start:], start=bp_start + 1):
+            nomer = row[col_nomer] if col_nomer < len(row) else None
+            summa = row[col_summa] if col_summa < len(row) else None
+            if nomer in (None, "") and summa in (None, ""):
+                continue
+            match = re.search(r'(\d+)', str(nomer)) if nomer not in (None, "") else None
+            if not match:
+                bp_row_errors.append(f"БП, строка {excel_row}: в выбранном столбце номера нет цифр.")
+                continue
+            id_clean = match.group(1).lstrip('0')
+            try:
+                s = float(summa) if summa not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                bp_row_errors.append(f"БП, строка {excel_row}: значение суммы «{summa}» не является числом.")
+                continue
+            bp_data[id_clean] = {'Номер': str(nomer), 'Сумма_БП': s}
 
         if not bp_data:
             bp_row_errors.append("БП: не найдено ни одной строки с распознаваемым номером документа.")
 
-        # 2. Чтение файла Реализаций
-        real_rows = read_first_sheet(file_real, "файл реализаций")
-        real_column_count = max((len(row) for row in real_rows), default=0)
-        if real_column_count < 3:
-            raise ValueError(
-                f"В файле реализаций на первом листе только {real_column_count} столбца(ов). "
-                "Нужны как минимум столбцы B (текст документа) и C (сумма)."
-            )
-        
+        # 2. Чтение выбранных столбцов таблицы реализаций
         real_data = {}
         real_row_errors = []
-        for row_idx, row in enumerate(real_rows):
-            try:
-                text_val = row[1]
-                sum_val = row[2]
-            except IndexError:
+        for row_idx, row in enumerate(real_rows[real_start:], start=real_start + 1):
+            text_val = row[col_real_text] if col_real_text < len(row) else None
+            sum_val = row[col_real_sum] if col_real_sum < len(row) else None
+            if not isinstance(text_val, str) or 'Реализация' not in text_val:
                 continue
-                
-            if isinstance(text_val, str) and 'Реализация' in text_val:
-                id_clean = extract_id_real(text_val)
-                excel_row = row_idx + 1
-                if not id_clean:
-                    real_row_errors.append(f"Реализации, строка {excel_row}: не удалось извлечь номер. Ожидается номер перед словом «от».")
-                    continue
-                try:
-                    s = float(sum_val) if sum_val not in ('', None) else 0.0
-                except (TypeError, ValueError):
-                    real_row_errors.append(f"Реализации, строка {excel_row}: сумма «{sum_val}» в столбце C не является числом.")
-                    continue
-                real_data[id_clean] = {'Text': text_val, 'Сумма_Реал': s}
+            id_clean = extract_id_real(text_val)
+            if not id_clean:
+                real_row_errors.append(f"Реализации, строка {row_idx}: не удалось извлечь номер из выбранного столбца текста. Ожидается номер перед словом «от».")
+                continue
+            try:
+                s = float(sum_val) if sum_val not in ('', None) else 0.0
+            except (TypeError, ValueError):
+                real_row_errors.append(f"Реализации, строка {row_idx}: значение суммы «{sum_val}» не является числом.")
+                continue
+            real_data[id_clean] = {'Text': text_val, 'Сумма_Реал': s}
 
         if not real_data:
             real_row_errors.append("Реализации: не найдено документов с текстом «Реализация» и номером, который можно распознать.")
@@ -212,7 +450,7 @@ def run_comparison():
     except Exception as e:
         messagebox.showerror("Ошибка", f"Произошла ошибка при обработке данных:\n{e}")
     finally:
-        btn_run.config(text="Запустить сверку", state=tk.NORMAL)
+        btn_run.config(text="Проверить и сверить", state=tk.NORMAL)
 
 def select_file(entry):
     path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
@@ -228,12 +466,13 @@ def select_save_file(entry):
         entry.delete(0, tk.END)
         entry.insert(0, path)
 
-def show_instructions():
-    window = tk.Toplevel(root)
+def show_instructions(parent=None):
+    owner = parent or root
+    window = tk.Toplevel(owner)
     window.title("Инструкция по работе")
     window.geometry("640x520")
     window.minsize(500, 380)
-    window.transient(root)
+    window.transient(owner)
 
     container = tk.Frame(window, padx=16, pady=14)
     container.pack(fill=tk.BOTH, expand=True)
@@ -251,12 +490,13 @@ def show_instructions():
 
 Подготовка таблицы БП
 • Допускаются файлы .xls и .xlsx; формат выбирается автоматически по расширению.
-• Данные должны находиться на первом (активном) листе; строка 1 содержит заголовки.
-• Укажите столбцы с заголовками «Номер» и «Сумма» именно в таком порядке
+• Можно выбрать лист и столбцы номера и суммы в окне предварительной проверки.
+• Программа предлагает столбцы автоматически по заголовкам и содержимому, выбор можно изменить.
+• Если первая строка — заголовки, отметьте флажок; распознанные заголовки отмечаются автоматически.
 
 Подготовка таблицы реализаций
 • Допускаются файлы .xls и .xlsx; формат выбирается автоматически по расширению.
-• Нужен первый лист. В столбце B (вторая колонка) должен быть текст документа, а в столбце C (третья колонка) — сумма.
+• Можно выбрать лист и столбцы текста документа и суммы; автоматический выбор можно скорректировать.
 • Текст документа должен содержать «Реализация» и номер непосредственно перед «от», например: «Реализация ... 000123 от 01.01.2026».
 • Заголовки не обязательны: данные читаются по позициям столбцов B и C. Строки без «Реализация» пропускаются.
 • При сравнении ведущие нули и буквенный префикс номера реализации не учитываются.
@@ -265,7 +505,9 @@ def show_instructions():
 1. Нажмите «Выбрать» и укажите файл БП (.xls или .xlsx).
 2. Выберите файл реализаций (.xls или .xlsx).
 3. Введите путь и имя итогового файла .xlsx в поле «Сохранить итог» или нажмите «Выбрать» рядом с ним.
-4. Нажмите «Запустить сверку».
+4. Нажмите «Проверить и сверить».
+5. Проверьте предложенные листы и столбцы, просмотрите первые строки и при необходимости поменяйте выбор.
+6. Нажмите «Продолжить сверку».
 
 Результат
 Создается файл Excel с листом «Расхождения». В нем остаются документы с ненулевой разницей, включая документы, найденные только в одной из таблиц. Отсутствующая сумма считается равной нулю, разница округляется до двух знаков. Если в таблице несколько документов с одним номером, при обработке останется последний встретившийся.
@@ -297,7 +539,7 @@ entry_out = tk.Entry(frame, width=40)
 entry_out.grid(row=2, column=1, padx=5, pady=5)
 tk.Button(frame, text="Выбрать", command=lambda: select_save_file(entry_out)).grid(row=2, column=2, pady=5)
 
-btn_run = tk.Button(frame, text="Запустить сверку", command=run_comparison, bg="#4F81BD", fg="white", font=("Arial", 10, "bold"))
+btn_run = tk.Button(frame, text="Проверить и сверить", command=run_comparison, bg="#4F81BD", fg="white", font=("Arial", 10, "bold"))
 btn_run.grid(row=3, column=0, columnspan=2, pady=15, ipadx=10, ipady=3)
 tk.Button(frame, text="Инструкция", command=show_instructions).grid(row=3, column=2, pady=15, ipadx=8, ipady=3)
 
