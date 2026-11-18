@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import re
@@ -115,6 +116,65 @@ def is_number(value):
         return True
     except (TypeError, ValueError):
         return False
+
+def inspect_sheet(sheet_index, sheet_name, rows, kind):
+    """Проверяет, можно ли автоматически использовать лист без ручной настройки."""
+    columns, has_header = guess_columns(kind, rows)
+    if len(set(columns)) != len(columns):
+        return None
+
+    start = 1 if has_header else 0
+    valid_records = 0
+    issues = []
+    for row_num, row in enumerate(rows[start:], start=start + 1):
+        first_col, amount_col = columns
+        first_value = row[first_col] if first_col < len(row) else None
+        amount_value = row[amount_col] if amount_col < len(row) else None
+
+        if kind == "bp":
+            if first_value in (None, "") and amount_value in (None, ""):
+                continue
+            match = re.search(r"(\d+)", str(first_value)) if first_value not in (None, "") else None
+            if not match:
+                issues.append(f"строка {row_num}: не распознан номер документа")
+                continue
+        else:
+            if not isinstance(first_value, str) or "реализация" not in first_value.lower():
+                continue
+            if not extract_id_real(first_value):
+                issues.append(f"строка {row_num}: не распознан номер реализации")
+                continue
+
+        if amount_value not in (None, ""):
+            try:
+                float(amount_value)
+            except (TypeError, ValueError):
+                issues.append(f"строка {row_num}: сумма не распознана как число")
+                continue
+        valid_records += 1
+
+    if valid_records == 0:
+        return None
+    return {
+        "sheet_index": sheet_index,
+        "rows": rows,
+        "columns": list(columns),
+        "skip_header": has_header,
+        "valid_records": valid_records,
+        "issues": issues,
+        "sheet_name": sheet_name,
+    }
+
+def find_auto_selection(sheets, kind):
+    """Возвращает автонастройку, если подходящий лист найден однозначно и есть валидные строки."""
+    candidates = []
+    for sheet_index, (sheet_name, rows) in enumerate(sheets):
+        candidate = inspect_sheet(sheet_index, sheet_name, rows, kind)
+        if candidate:
+            candidates.append(candidate)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
 
 def choose_columns(bp_sheets, real_sheets):
     """Показывает автоопределение, выбор листов/столбцов и предпросмотр."""
@@ -240,7 +300,7 @@ def choose_columns(bp_sheets, real_sheets):
     def cancel():
         dialog.destroy()
 
-    ttk.Label(dialog, text="Проверьте автоподбор отдельно для каждой таблицы. Выберите лист и столбцы, затем сверьте выбор с предпросмотром.",
+    ttk.Label(dialog, text="Автоподбор не смог однозначно проверить входные данные. Исправьте выбор отдельно для каждой таблицы и сверьте его с предпросмотром.",
               wraplength=width - 40).pack(anchor="w", padx=14, pady=(8, 2))
 
     buttons = ttk.Frame(dialog)
@@ -322,9 +382,14 @@ def run_comparison():
         messagebox.showwarning("Пустая книга", "В файле реализаций нет листов.")
         return
 
-    selected = choose_columns(bp_sheets, real_sheets)
-    if selected is None:
-        return
+    bp_auto = find_auto_selection(bp_sheets, "bp")
+    real_auto = find_auto_selection(real_sheets, "real")
+    if bp_auto and real_auto:
+        selected = {"bp": bp_auto, "real": real_auto}
+    else:
+        selected = choose_columns(bp_sheets, real_sheets)
+        if selected is None:
+            return
 
     bp_selection = selected["bp"]
     real_selection = selected["real"]
@@ -350,13 +415,14 @@ def run_comparison():
                 continue
             match = re.search(r'(\d+)', str(nomer)) if nomer not in (None, "") else None
             if not match:
-                bp_row_errors.append(f"БП, строка {excel_row}: в выбранном столбце номера нет цифр.")
+                document_label = nomer if nomer not in (None, "") else "не указан"
+                bp_row_errors.append(f"БП, строка {excel_row}, документ «{document_label}»: номер не содержит цифр.")
                 continue
             id_clean = match.group(1).lstrip('0')
             try:
                 s = float(summa) if summa not in (None, "") else 0.0
             except (TypeError, ValueError):
-                bp_row_errors.append(f"БП, строка {excel_row}: значение суммы «{summa}» не является числом.")
+                bp_row_errors.append(f"БП, строка {excel_row}, документ «{nomer}»: сумма «{summa}» не является числом.")
                 continue
             bp_data[id_clean] = {'Номер': str(nomer), 'Сумма_БП': s}
 
@@ -373,12 +439,12 @@ def run_comparison():
                 continue
             id_clean = extract_id_real(text_val)
             if not id_clean:
-                real_row_errors.append(f"Реализации, строка {row_idx}: не удалось извлечь номер из выбранного столбца текста. Ожидается номер перед словом «от».")
+                real_row_errors.append(f"УТ, строка {row_idx}, документ «{text_val}»: не удалось извлечь номер перед словом «от».")
                 continue
             try:
                 s = float(sum_val) if sum_val not in ('', None) else 0.0
             except (TypeError, ValueError):
-                real_row_errors.append(f"Реализации, строка {row_idx}: значение суммы «{sum_val}» не является числом.")
+                real_row_errors.append(f"УТ, строка {row_idx}, документ «{text_val}»: сумма «{sum_val}» не является числом.")
                 continue
             real_data[id_clean] = {'Text': text_val, 'Сумма_Реал': s}
 
@@ -386,66 +452,79 @@ def run_comparison():
             real_row_errors.append("Реализации: не найдено документов с текстом «Реализация» и номером, который можно распознать.")
 
         data_errors = bp_row_errors + real_row_errors
-        if data_errors:
-            shown_errors = data_errors[:15]
-            if len(data_errors) > len(shown_errors):
-                shown_errors.append(f"…и еще {len(data_errors) - len(shown_errors)} ошибок.")
-            messagebox.showwarning("Проверьте структуру и данные", "Сверка не выполнена. Исправьте найденные проблемы:\n\n• " + "\n• ".join(shown_errors))
-            return
 
         # 3. Сверка данных
         all_ids = set(bp_data.keys()).union(set(real_data.keys()))
         report_data = []
+        only_real_data = []
+        only_bp_data = []
         
         for doc_id in all_ids:
             b_info = bp_data.get(doc_id, {'Номер': 'Отсутствует в БП', 'Сумма_БП': 0.0})
             r_info = real_data.get(doc_id, {'Text': 'Отсутствует в выгрузке реализаций', 'Сумма_Реал': 0.0})
             
             diff = round(b_info['Сумма_БП'] - r_info['Сумма_Реал'], 2)
+            row_data = [
+                b_info['Номер'],
+                b_info['Сумма_БП'],
+                r_info['Text'],
+                r_info['Сумма_Реал'],
+                diff,
+            ]
+            if doc_id not in bp_data:
+                only_real_data.append(row_data)
+            elif doc_id not in real_data:
+                only_bp_data.append(row_data)
             if diff != 0:
-                report_data.append([
-                    b_info['Номер'],
-                    b_info['Сумма_БП'],
-                    r_info['Text'],
-                    r_info['Сумма_Реал'],
-                    diff
-                ])
+                report_data.append(row_data)
 
         # 4. Формирование Excel отчета
         wb_out = Workbook()
-        ws_out = wb_out.active
-        ws_out.title = "Расхождения"
-
         headers = ['Номер документа (из БП)', 'Сумма (БП)', 'Документ (из Окт. Реал)', 'Сумма (Окт. Реал)', 'Разница (БП - Реал)']
-        ws_out.append(headers)
-
-        for row_data in report_data:
-            ws_out.append(row_data)
-
-        # Стилизация шапки
         header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
-        for cell in ws_out[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # Автоширина колонок и формат чисел
-        for col in ws_out.columns:
-            max_length = 0
-            column_letter = col[0].column_letter
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-                if cell.row > 1 and cell.column in [2, 4, 5]:
-                    cell.number_format = '#,##0.00'
-            ws_out.column_dimensions[column_letter].width = min(max_length + 2, 60)
+        def add_report_sheet(title, rows):
+            sheet = wb_out.active if title == "Расхождения" else wb_out.create_sheet(title=title)
+            sheet.title = title
+            sheet.append(headers)
+            for row_data in rows:
+                sheet.append(row_data)
+
+            for cell in sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            for col in sheet.columns:
+                max_length = max((len(str(cell.value)) for cell in col if cell.value is not None), default=0)
+                letter = col[0].column_letter
+                for cell in col:
+                    if cell.row > 1 and cell.column in [2, 4, 5]:
+                        cell.number_format = '#,##0.00'
+                sheet.column_dimensions[letter].width = min(max_length + 2, 60)
+
+        add_report_sheet("Расхождения", report_data)
+        add_report_sheet("Есть в УТ, нет в БП", only_real_data)
+        add_report_sheet("Есть в БП, нет в УТ", only_bp_data)
 
         wb_out.save(output_file)
-        messagebox.showinfo("Готово", f"Сверка успешно завершена!\nНайдено расхождений: {len(report_data)}")
+        summary = (
+            f"Результат сохранен: {output_file}\n"
+            f"Расхождений: {len(report_data)}; только в УТ: {len(only_real_data)}; "
+            f"только в БП: {len(only_bp_data)}."
+        )
+        if data_errors:
+            shown_errors = data_errors[:20]
+            if len(data_errors) > len(shown_errors):
+                shown_errors.append(f"…и еще {len(data_errors) - len(shown_errors)} пропущенных строк/проблем.")
+            messagebox.showwarning(
+                "Сверка завершена с пропусками",
+                summary + "\n\nНекоторые строки пропущены или не содержат распознаваемых документов:\n\n• "
+                + "\n• ".join(shown_errors),
+            )
+        else:
+            messagebox.showinfo("Готово", summary)
 
     except Exception as e:
         messagebox.showerror("Ошибка", f"Произошла ошибка при обработке данных:\n{e}")
@@ -483,41 +562,40 @@ def show_instructions(parent=None):
     instructions.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scrollbar.config(command=instructions.yview)
 
-    instructions.insert("1.0", """ИНСТРУКЦИЯ ПО СВЕРКЕ ДОКУМЕНТОВ 1С
+    instructions.insert("1.0", """КАК СВЕРИТЬ ДОКУМЕНТЫ
 
-Назначение
-Утилита сопоставляет документы из выгрузки БП и выгрузки реализаций по номеру, сравнивает суммы и сохраняет отчет с расхождениями.
+1. Выберите файл БП и файл реализаций. Поддерживаются Excel .xls и .xlsx.
+2. Укажите имя и папку для итогового файла .xlsx.
+3. Нажмите «Проверить и сверить».
 
-Подготовка таблицы БП
-• Допускаются файлы .xls и .xlsx; формат выбирается автоматически по расширению.
-• Можно выбрать лист и столбцы номера и суммы в окне предварительной проверки.
-• Программа предлагает столбцы автоматически по заголовкам и содержимому, выбор можно изменить.
-• Если первая строка — заголовки, отметьте флажок; распознанные заголовки отмечаются автоматически.
+Какие данные нужны
+• В БП должны быть номер документа и сумма. Заголовки «Номер» и «Сумма» помогают программе найти столбцы автоматически.
+• В реализации нужен текст документа со словом «Реализация» и номером перед «от» (например, «Реализация ... 000123 от 01.01.2026»), а также сумма.
+• Листы и расположение столбцов могут отличаться. Программа попробует распознать их сама.
 
-Подготовка таблицы реализаций
-• Допускаются файлы .xls и .xlsx; формат выбирается автоматически по расширению.
-• Можно выбрать лист и столбцы текста документа и суммы; автоматический выбор можно скорректировать.
-• Текст документа должен содержать «Реализация» и номер непосредственно перед «от», например: «Реализация ... 000123 от 01.01.2026».
-• Заголовки не обязательны: данные читаются по позициям столбцов B и C. Строки без «Реализация» пропускаются.
-• При сравнении ведущие нули и буквенный префикс номера реализации не учитываются.
+Как вывести отчет в БП
+• Открыть Реализации
+• Установить нужный период (Еще -> Установить период...)
+• Сделать отбор. (Еще -> Настроить список...-> Отбор) Контрагент: Папки Собств.нужды, Удаленные, Собственные организации, ООО ТД Палитра. Номер: Содержит ЛИУТ
+• Еще -> Вывести список. Проставить галки Номер и Сумма и сохранить файл в формате .xlsx 
 
-Порядок работы
-1. Нажмите «Выбрать» и укажите файл БП (.xls или .xlsx).
-2. Выберите файл реализаций (.xls или .xlsx).
-3. Введите путь и имя итогового файла .xlsx в поле «Сохранить итог» или нажмите «Выбрать» рядом с ним.
-4. Нажмите «Проверить и сверить».
-5. Проверьте предложенные листы и столбцы, просмотрите первые строки и при необходимости поменяйте выбор.
-6. Нажмите «Продолжить сверку».
+Если открылось окно проверки
+Выберите для БП и реализаций лист, номер/текст и сумму. Сверьтесь с предпросмотром. Если в первой строке заголовки, оставьте включенным флажок «Пропустить первую строку». Автоподбор для БП и УТ настраивается отдельно. Нажмите «Продолжить сверку».
 
-Результат
-Создается файл Excel с листом «Расхождения». В нем остаются документы с ненулевой разницей, включая документы, найденные только в одной из таблиц. Отсутствующая сумма считается равной нулю, разница округляется до двух знаков. Если в таблице несколько документов с одним номером, при обработке останется последний встретившийся.
+Если окно проверки не открылось, программа распознала обе таблицы и сразу начала сверку.
 
-Проверьте период выгрузок и корректность номеров перед запуском.""")
+Что будет в результате
+Файл содержит три листа:
+• «Расхождения» — документы с разницей в суммах.
+• «Есть в УТ, нет в БП» — документы только из УТ.
+• «Есть в БП, нет в УТ» — документы только из БП.
+
+Номера сравниваются без ведущих нулей. Отсутствующая сумма считается нулевой, разница округляется до двух знаков. Строки с ошибками пропускаются: сверка продолжится, а после сохранения отчета появится предупреждение с номером строки и документом.""")
     instructions.config(state=tk.DISABLED)
     tk.Button(window, text="Закрыть", command=window.destroy).pack(pady=(0, 12))
 
 root = tk.Tk()
-root.title("Сверка документов 1С v0.3")
+root.title("Сверка документов 1С v1.1")
 root.geometry("540x230")
 root.resizable(False, False)
 
